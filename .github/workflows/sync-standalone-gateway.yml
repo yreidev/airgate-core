@@ -1,0 +1,107 @@
+name: Sync and build standalone gateway
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Build even when the upstream commit is unchanged
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: sync-standalone-gateway
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/yreidev/airgate-core
+  UPSTREAM_REPOSITORY: DouDOU-start/airgate-core
+  UPSTREAM_BRANCH: standalone-gateway
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork automation branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect and sync upstream changes
+        id: sync
+        env:
+          FORCE_BUILD: ${{ inputs.force_build || 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+          upstream_sha="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+          fork_sha="$(git ls-remote origin "refs/heads/${UPSTREAM_BRANCH}" | awk '{print $1}')"
+          changed=false
+
+          if [[ "${upstream_sha}" != "${fork_sha}" ]]; then
+            if [[ -n "${fork_sha}" ]]; then
+              git push \
+                --force-with-lease="refs/heads/${UPSTREAM_BRANCH}:${fork_sha}" \
+                origin "${upstream_sha}:refs/heads/${UPSTREAM_BRANCH}"
+            else
+              git push origin "${upstream_sha}:refs/heads/${UPSTREAM_BRANCH}"
+            fi
+            changed=true
+          fi
+
+          if [[ "${FORCE_BUILD}" == "true" ]]; then
+            changed=true
+          fi
+
+          echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_sha=${upstream_sha}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${upstream_sha:0:12}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check out standalone gateway source
+        if: steps.sync.outputs.changed == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ steps.sync.outputs.upstream_sha }}
+
+      - name: Set up Docker Buildx
+        if: steps.sync.outputs.changed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: steps.sync.outputs.changed == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        if: steps.sync.outputs.changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VERSION=standalone-${{ steps.sync.outputs.short_sha }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:standalone-gateway
+            ${{ env.IMAGE_NAME }}:standalone-${{ steps.sync.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.sync.outputs.upstream_sha }}
+            org.opencontainers.image.version=standalone-${{ steps.sync.outputs.short_sha }}
+          cache-from: type=gha,scope=standalone-gateway
+          cache-to: type=gha,mode=max,scope=standalone-gateway
